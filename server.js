@@ -1,58 +1,54 @@
+// server.js (corrected)
+
 // ========================== IMPORTS ==========================
-require("dotenv").config(); // Load environment variables from .env
+require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const session = require("express-session");
 const passport = require("passport");
 const LocalStrategy = require("passport-local").Strategy;
-const bodyParser = require("body-parser");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const User = require("./models/user"); // Import User Model
-const app = express();
-//console.log("JWT Secret:", process.env.JWT_SECRET);
+const User = require("./models/user");
+const Token = require("./models/token");
 
+const app = express();
+
+// ========================== MIDDLEWARE ==========================
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// debug header
 app.use((req, res, next) => {
   console.log("Request Content-Type:", req.headers["content-type"]);
   next();
 });
 
-// ========================== MIDDLEWARE ==========================
-app.use(express.json()); // For JSON payloads
-app.use(express.urlencoded({ extended: true }));
-
-// ========================== DATABASE CONNECT ==========================
+// ========================== DB ==========================
 mongoose
-  .connect("mongodb://127.0.0.1:27017/passportJwtDemo")
+  .connect(process.env.MONGO_URL || "mongodb://127.0.0.1:27017/passportJwtDemo")
   .then(() => console.log("✅ MongoDB Connected"))
   .catch((err) => console.log("❌ DB Error:", err));
 
-// ========================== SESSION CONFIG ==========================
+// ========================== SESSIONS & PASSPORT ==========================
 app.use(
   session({
-    secret: "thisissecret",
+    secret: process.env.SESSION_SECRET || "thisissecret",
     resave: false,
     saveUninitialized: false,
   })
 );
-
-// ========================== PASSPORT CONFIG ==========================
 app.use(passport.initialize());
 app.use(passport.session());
 
-// Local Strategy (username/password based)
+// --------------------------- Passport Local Strategy ---------------------------
 passport.use(
   new LocalStrategy(async (username, password, done) => {
     try {
-      console.log("Login Attempt →", username);
-
-      const user = await User.findOne({ username });
+      const user = await User.findOne({ username }); // use username consistently
       if (!user) return done(null, false, { message: "User not found" });
-
       const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch)
-        return done(null, false, { message: "Incorrect password" });
-
+      if (!isMatch) return done(null, false, { message: "Incorrect password" });
       return done(null, user);
     } catch (err) {
       return done(err);
@@ -60,12 +56,7 @@ passport.use(
   })
 );
 
-// Serialize user to session
-passport.serializeUser((user, done) => {
-  done(null, user.id);
-});
-
-// Deserialize user from session
+passport.serializeUser((user, done) => done(null, user.id));
 passport.deserializeUser(async (id, done) => {
   try {
     const user = await User.findById(id);
@@ -75,149 +66,126 @@ passport.deserializeUser(async (id, done) => {
   }
 });
 
-// ========================== JWT TOKEN FUNCTIONS ==========================
+// ========================== JWT HELPERS (consistent names) ==========================
+const ACCESS_SECRET = process.env.ACCESS_TOKEN_SECRET || process.env.JWT_SECRET;
+const REFRESH_SECRET = process.env.REFRESH_TOKEN_SECRET || process.env.JWT_REFRESH_SECRET;
 
-// Generate Access Token (Short Expiry)
-function generateAccessToken(user) {
-  return jwt.sign(
-    { id: user._id, username: user.username },
-    process.env.JWT_SECRET,
-    { expiresIn: "3m" } // 3 minutes expiry
-  );
+function generateAccessToken(payload) {
+  // payload should be { id, username } or similar
+  return jwt.sign(payload, ACCESS_SECRET, { expiresIn: "3m" });
 }
 
-// Generate Refresh Token (Long Expiry)
-function generateRefreshToken(user) {
-  return jwt.sign(
-    { id: user._id, username: user.username },
-    process.env.JWT_REFRESH_SECRET,
-    { expiresIn: "7d" } // 7 days expiry
-  );
+function generateRefreshToken(payload) {
+  return jwt.sign(payload, REFRESH_SECRET, { expiresIn: "7d" });
 }
-
-// Temporary store for refresh tokens (can use Redis or DB in real app)
-let refreshTokens = [];
 
 // ========================== ROUTES ==========================
 
-// -------- SIGNUP ROUTE --------
+// Signup (stores username + hashed password)
 app.post("/signup", async (req, res) => {
   try {
     const { username, password } = req.body;
+    if (!username || !password) return res.status(400).json({ message: "Username and password required" });
 
-    // Validation
-    if (!username || !password) {
-      return res
-        .status(400)
-        .json({ message: "Username and password are required" });
-    }
+    const existing = await User.findOne({ username });
+    if (existing) return res.status(400).json({ message: "User already exists" });
 
-    // Hash password
-    const hashedPassword = await bcrypt.hash(password, 10);
-
-    // Create new user
-    const newUser = new User({
-      username,
-      password: hashedPassword,
-    });
-
+    const hashed = await bcrypt.hash(password, 10);
+    const newUser = new User({ username, password: hashed });
     await newUser.save();
-    res.status(201).json({ message: "User created successfully", newUser });
+    res.status(201).json({ message: "User created", user: { id: newUser._id, username: newUser.username } });
   } catch (err) {
     console.error("Signup Error:", err);
     res.status(500).json({ message: "Error creating user" });
   }
 });
 
-// -------- LOGIN ROUTE (Local Auth + JWT Generation) --------
-app.post("/login", (req, res, next) => {
-  passport.authenticate("local", (err, user, info) => {
-    if (err) return next(err);
-    if (!user) return res.status(400).json({ message: "Invalid credentials" });
+// Login — issues access & refresh tokens and stores refresh token in DB
+app.post("/login", async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    // keep same field names as signup (username)
+    if (!username || !password) return res.status(400).json({ message: "Username and password required" });
 
-    // login() will create session for user
-    req.logIn(user, (err) => {
-      if (err) return next(err);
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ message: "User not found" });
 
-      // Generate Tokens
-      const accessToken = generateAccessToken(user);
-      const refreshToken = generateRefreshToken(user);
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ message: "Invalid password" });
 
-      // Store refresh token temporarily
-      refreshTokens.push(refreshToken);
+    const payload = { id: user._id.toString(), username: user.username };
+    const accessToken = generateAccessToken(payload);
+    const refreshToken = generateRefreshToken(payload);
 
-      res.json({
-        message: "Login successful!",
-        username: user.username,
-        accessToken,
-        refreshToken,
-      });
-    });
-  })(req, res, next);
+    // Save refresh token to DB
+    await Token.create({ token: refreshToken });
+
+    res.json({ message: "Login successful", accessToken, refreshToken });
+  } catch (err) {
+    console.error("Login Error:", err);
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
-// -------- REFRESH TOKEN ROUTE --------
-app.post("/refresh", (req, res) => {
-  
-  console.log("🔹 Body received:", req.body);
-  
-  
-
-if (!req.body || !req.body.token) {
-    return res.status(400).json({ message: "Request body or token missing" });
-  }
-  const { token } = req.body;
-  if (!token)
-    return res.status(401).json({ message: "Refresh token required" });
-  if (!refreshTokens.includes(token))
-    return res.status(403).json({ message: "Invalid refresh token" });
-
+// Refresh route — check DB then verify and return new access token
+app.post("/refresh", async (req, res) => {
   try {
-    const user = jwt.verify(token, process.env.JWT_REFRESH_SECRET);
-    const newAccessToken = generateAccessToken(user);
+    const { token } = req.body;
+    if (!token) return res.status(401).json({ message: "Refresh token required" });
+
+    // check DB
+    const stored = await Token.findOne({ token });
+    if (!stored) return res.status(403).json({ message: "Invalid refresh token" });
+
+    // verify signature/expiry
+    const decoded = jwt.verify(token, REFRESH_SECRET); // will throw if invalid/expired
+    const payload = { id: decoded.id, username: decoded.username };
+    const newAccessToken = generateAccessToken(payload);
+
     res.json({ accessToken: newAccessToken });
   } catch (err) {
-    res.status(403).json({ message: "Invalid or expired refresh token" });
+    console.error("Refresh Error:", err.message);
+    return res.status(403).json({ message: "Invalid or expired refresh token" });
   }
 });
 
-// -------- LOGOUT ROUTE --------
-app.post("/logout", (req, res) => {
-  const { token } = req.body;
-  refreshTokens = refreshTokens.filter((t) => t !== token);
-  req.logout(() => {});
-  res.json({ message: "Logged out successfully!" });
+// Logout — remove refresh token from DB
+app.post("/logout", async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (token) {
+      await Token.deleteOne({ token });
+    }
+    // also log out passport session if present
+    req.logout(() => {});
+    res.json({ message: "Logged out" });
+  } catch (err) {
+    res.status(500).json({ message: "Server error" });
+  }
 });
 
-// -------- ACCESS TOKEN VERIFICATION MIDDLEWARE --------
+// verify access token middleware (uses same ACCESS_SECRET)
 function verifyAccessToken(req, res, next) {
   const authHeader = req.headers["authorization"];
-  const token = authHeader && authHeader.split(" ")[1]; // Bearer <token>
-
+  const token = authHeader && authHeader.split(" ")[1];
   if (!token) return res.status(401).json({ message: "Access token required" });
 
-  try {
-    const verified = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = verified;
+  jwt.verify(token, ACCESS_SECRET, (err, decoded) => {
+    if (err) return res.status(403).json({ message: "Invalid or expired access token" });
+    req.user = decoded;
     next();
-  } catch (err) {
-    res.status(403).json({ message: "Invalid or expired access token" });
-  }
+  });
 }
 
-// -------- PROTECTED ROUTE --------
+// protected route
 app.get("/protected", verifyAccessToken, (req, res) => {
-  res.json({
-    message: "Access granted to protected route ✅",
-    user: req.user,
-  });
+  res.json({ message: "Access granted", user: req.user });
 });
+
+// test route
 app.post("/test", (req, res) => {
   console.log("Body received:", req.body);
   res.json(req.body);
 });
 
-// ========================== START SERVER ==========================
-app.listen(3000, () => {
-  console.log("🚀 Server running on http://localhost:3000");
-});
+app.listen(3000, () => console.log("🚀 Server running on http://localhost:3000"));
